@@ -1,0 +1,668 @@
+substitutions:
+  name: "esp32s3-touch-147m"
+  friendly_name: "ESP32-S3-Touch-LCD-1.47-M"
+  device_description: "ESP32-S3-Touch-LCD-1.47-M with 4-Screen Home Assistant Switch UI"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  comment: ${device_description}
+  min_version: 2024.6.0
+  on_boot:
+    priority: 600
+    then:
+      - lambda: |-
+          id(boot_start_time) = millis();
+          id(last_activity_time) = millis();
+          id(screen_is_dimmed) = false;
+          id(is_booting) = true;
+          id(current_screen) = 0; // 0 = boot screen
+          id(my_display).show_page(page_boot);
+      # Boot animation lasts for 3 seconds
+      - delay: 3s
+      - lambda: |-
+          id(is_booting) = false;
+          id(current_screen) = 1; // Transition to Screen 1 (Switches 1 & 2)
+          id(last_activity_time) = millis();
+          id(my_display).show_page(page_1_switches);
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32_S3_DEFAULT_CPU_FREQ_240MHZ: "y"
+      CONFIG_SPIRAM_MODE_OCT: "y"
+      CONFIG_SPIRAM_SPEED_80M: "y"
+      CONFIG_ESP32S3_SPIRAM_SUPPORT: "y"
+
+# Local components for AXS5106L capacitive touchscreen & custom-tuned ST7789V driver
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [ axs5106, st7789v ]
+
+# Logging (routed to USB-C Serial/JTAG)
+logger:
+  level: DEBUG
+  hardware_uart: USB_SERIAL_JTAG
+
+# Home Assistant Native API
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  fast_connect: false
+  ap:
+    ssid: "ESP32-S3-Touch-LCD-1.47-M"
+    password: !secret fallback_password
+
+captive_portal:
+
+# Real-time clock synchronization via SNTP
+time:
+  - platform: sntp
+    id: ha_time
+    timezone: "Europe/Amsterdam"
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - time.google.com
+
+# Global state variables
+globals:
+  - id: is_booting
+    type: bool
+    initial_value: 'true'
+  - id: boot_start_time
+    type: uint32_t
+    initial_value: '0'
+  - id: current_screen
+    type: int
+    initial_value: '0' # 0=Boot, 1=Switches 1-2, 2=Switches 3-4, 3=Switches 5-6, 4=Switches 7-8
+  - id: gesture_handled
+    type: bool
+    initial_value: 'false'
+  - id: touch_active
+    type: bool
+    initial_value: 'false'
+  - id: touch_start_x
+    type: int
+    initial_value: '0'
+  - id: touch_start_y
+    type: int
+    initial_value: '0'
+  - id: touch_start_time
+    type: uint32_t
+    initial_value: '0'
+  - id: last_activity_time
+    type: uint32_t
+    initial_value: '0'
+  - id: screen_is_dimmed
+    type: bool
+    initial_value: 'false'
+
+# 1-minute Inactivity Auto-Dim Timer
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(is_booting)) return;
+          // Dim backlight to 0% after 60 seconds (1 minute) of non-use
+          if (!id(screen_is_dimmed) && (millis() - id(last_activity_time) > 60000)) {
+            id(screen_is_dimmed) = true;
+            auto call = id(lcd_backlight).turn_off();
+            call.set_transition_length(1000); // 1-second smooth dim
+            call.perform();
+            ESP_LOGI("display", "Backlight auto-dimmed to 0%% after 1 minute of inactivity");
+          }
+
+# Hardware SPI for LCD (ESP32-S3-Touch-LCD-1.47-M Pinout)
+# LCD_SCL = GPIO38, LCD_SDA = GPIO39
+spi:
+  clk_pin: GPIO38
+  mosi_pin: GPIO39
+
+# Hardware I2C for Capacitive Touch (ESP32-S3-Touch-LCD-1.47-M Pinout)
+# TP_SDA = GPIO42, TP_SCL = GPIO41
+i2c:
+  - id: bus_touch
+    sda: GPIO42
+    scl: GPIO41
+    frequency: 400kHz
+    scan: true
+
+# LCD Backlight PWM control (LCD_BL = GPIO46)
+output:
+  - platform: ledc
+    pin: GPIO46
+    id: backlight_pwm
+
+# Screen Backlight (Acts as a dimmable lamp in Home Assistant)
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Screen Backlight"
+    id: lcd_backlight
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0.5s
+    on_turn_on:
+      - lambda: |-
+          id(screen_is_dimmed) = false;
+          id(last_activity_time) = millis();
+
+# 8 Home Assistant Switches (Exposed as independent on-off switches)
+switch:
+  - platform: template
+    name: "Switch 1"
+    id: switch_1
+    optimistic: true
+    icon: "mdi:toggle-switch"
+
+  - platform: template
+    name: "Switch 2"
+    id: switch_2
+    optimistic: true
+    icon: "mdi:toggle-switch"
+
+  - platform: template
+    name: "Switch 3"
+    id: switch_3
+    optimistic: true
+    icon: "mdi:toggle-switch"
+
+  - platform: template
+    name: "Switch 4"
+    id: switch_4
+    optimistic: true
+    icon: "mdi:toggle-switch"
+
+  - platform: template
+    name: "Switch 5"
+    id: switch_5
+    optimistic: true
+    icon: "mdi:toggle-switch"
+
+  - platform: template
+    name: "Switch 6"
+    id: switch_6
+    optimistic: true
+    icon: "mdi:toggle-switch"
+
+  - platform: template
+    name: "Switch 7"
+    id: switch_7
+    optimistic: true
+    icon: "mdi:toggle-switch"
+
+  - platform: template
+    name: "Switch 8"
+    id: switch_8
+    optimistic: true
+    icon: "mdi:toggle-switch"
+
+# Fonts (Local font file for offline, robust compilation)
+font:
+  - file: "fonts/arial.ttf"
+    id: font_huge
+    size: 38
+    glyphs: '0123456789:.- '
+
+  - file: "fonts/arial.ttf"
+    id: font_boot
+    size: 46
+    glyphs: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+
+  - file: "fonts/arial.ttf"
+    id: font_title
+    size: 20
+    glyphs: '!"#$%&()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz| '
+
+  - file: "fonts/arial.ttf"
+    id: font_button
+    size: 16
+    glyphs: '!"#$%&()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz| '
+
+  - file: "fonts/arial.ttf"
+    id: font_text
+    size: 14
+    glyphs: '!"#$%&()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz| '
+
+  - file: "fonts/arial.ttf"
+    id: font_small
+    size: 12
+    glyphs: '!"#$%&()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz| '
+
+  - file: "fonts/arial.ttf"
+    id: font_info
+    size: 20
+    glyphs: '!"#$%&()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz| '
+
+# Predefined UI Colors
+color:
+  - id: color_red
+    red: 100%
+    green: 0%
+    blue: 0%
+  - id: color_green
+    red: 0%
+    green: 90%
+    blue: 15%
+  - id: color_blue
+    red: 0%
+    green: 20%
+    blue: 100%
+  - id: color_white
+    red: 100%
+    green: 100%
+    blue: 100%
+  - id: color_black
+    red: 0%
+    green: 0%
+    blue: 0%
+  - id: color_dark_bg
+    red: 0%
+    green: 0%
+    blue: 0%
+  - id: color_gray
+    red: 35%
+    green: 35%
+    blue: 40%
+  - id: color_light_gray
+    red: 70%
+    green: 70%
+    blue: 75%
+  - id: color_amber
+    red: 100%
+    green: 75%
+    blue: 0%
+  - id: color_btn_on_bg
+    red: 10%
+    green: 65%
+    blue: 25%
+  - id: color_btn_off_bg
+    red: 14%
+    green: 16%
+    blue: 20%
+  - id: color_border_off
+    red: 35%
+    green: 38%
+    blue: 45%
+
+# Custom tuned ST7789V display for ESP32-S3-Touch-LCD-1.47-M
+# LCD_CS = GPIO21, LCD_DC = GPIO45, LCD_RST = GPIO40
+display:
+  - platform: st7789v
+    model: ESP32-S3-Touch-LCD-1.47-M
+    id: my_display
+    cs_pin: GPIO21
+    dc_pin: GPIO45
+    reset_pin: GPIO40
+    data_rate: 20MHz
+    update_interval: 100ms
+    invert_colors: false
+    color_order: BGR
+    madctl: 0x80 # Flips row order (MY) to unmirror horizontal in 90-degree landscape
+
+    pages:
+      # =========================================================================
+      # BOOT SCREEN: 3 seconds alternating R, G, B background with text "TECHN8"
+      # =========================================================================
+      - id: page_boot
+        lambda: |-
+          uint32_t elapsed = millis() - id(boot_start_time);
+          int phase = (elapsed / 1000) % 3;
+          
+          if (phase == 0) {
+            it.fill(id(color_red));
+          } else if (phase == 1) {
+            it.fill(id(color_green));
+          } else {
+            it.fill(id(color_blue));
+          }
+          
+          int cx = 160;
+          int cy = 86;
+          it.printf(cx + 2, cy + 2, id(font_boot), id(color_black), TextAlign::CENTER, "TECHN8");
+          it.printf(cx, cy, id(font_boot), id(color_white), TextAlign::CENTER, "TECHN8");
+
+      # =========================================================================
+      # SCREEN 1: Switches - Buttons 1 & 2
+      # =========================================================================
+      - id: page_1_switches
+        lambda: |-
+          it.fill(id(color_dark_bg));
+          
+          // Header: "Switches" on left, "1/4" on right, divider line 10px lower (y=36)
+          it.print(16, 18, id(font_title), id(color_white), TextAlign::CENTER_LEFT, "Switches");
+          it.print(304, 18, id(font_info), id(color_light_gray), TextAlign::CENTER_RIGHT, "1/4");
+          it.horizontal_line(16, 36, 288, id(color_gray));
+
+          // BUTTON 1 (Left: x:30, y:50, w:114, h:80)
+          bool s1 = id(switch_1).state;
+          if (s1) {
+            it.filled_rectangle(30, 50, 114, 80, id(color_btn_on_bg));
+            it.rectangle(30, 50, 114, 80, id(color_white));
+            it.rectangle(31, 51, 112, 78, id(color_green));
+            it.print(87, 90, id(font_huge), id(color_white), TextAlign::CENTER, "1");
+          } else {
+            it.filled_rectangle(30, 50, 114, 80, id(color_btn_off_bg));
+            it.rectangle(30, 50, 114, 80, id(color_border_off));
+            it.print(87, 90, id(font_huge), id(color_light_gray), TextAlign::CENTER, "1");
+          }
+
+          // BUTTON 2 (Right: x:176, y:50, w:114, h:80)
+          bool s2 = id(switch_2).state;
+          if (s2) {
+            it.filled_rectangle(176, 50, 114, 80, id(color_btn_on_bg));
+            it.rectangle(176, 50, 114, 80, id(color_white));
+            it.rectangle(177, 51, 112, 78, id(color_green));
+            it.print(233, 90, id(font_huge), id(color_white), TextAlign::CENTER, "2");
+          } else {
+            it.filled_rectangle(176, 50, 114, 80, id(color_btn_off_bg));
+            it.rectangle(176, 50, 114, 80, id(color_border_off));
+            it.print(233, 90, id(font_huge), id(color_light_gray), TextAlign::CENTER, "2");
+          }
+
+          // Bottom Bar (y=154): IP on left, Live Time on right (consistent 10px font)
+          auto ip = wifi::global_wifi_component->wifi_sta_ip_addresses();
+          if (!ip.empty() && ip[0].is_set()) {
+            char ip_buf[20];
+            ip[0].str_to(ip_buf);
+            it.print(16, 152, id(font_info), id(color_green), TextAlign::CENTER_LEFT, ip_buf);
+          }
+          auto time_now = id(ha_time).now();
+          if (time_now.is_valid()) {
+            it.strftime(304, 152, id(font_info), id(color_white), TextAlign::CENTER_RIGHT, "%H:%M:%S", time_now);
+          } else {
+            it.print(304, 152, id(font_info), id(color_amber), TextAlign::CENTER_RIGHT, "--:--:--");
+          }
+
+      # =========================================================================
+      # SCREEN 2: Switches - Buttons 3 & 4
+      # =========================================================================
+      - id: page_2_switches
+        lambda: |-
+          it.fill(id(color_dark_bg));
+          
+          it.print(16, 18, id(font_title), id(color_white), TextAlign::CENTER_LEFT, "Switches");
+          it.print(304, 18, id(font_info), id(color_light_gray), TextAlign::CENTER_RIGHT, "2/4");
+          it.horizontal_line(16, 36, 288, id(color_gray));
+
+          // BUTTON 3 (Left: x:30, y:50, w:114, h:80)
+          bool s3 = id(switch_3).state;
+          if (s3) {
+            it.filled_rectangle(30, 50, 114, 80, id(color_btn_on_bg));
+            it.rectangle(30, 50, 114, 80, id(color_white));
+            it.rectangle(31, 51, 112, 78, id(color_green));
+            it.print(87, 90, id(font_huge), id(color_white), TextAlign::CENTER, "3");
+          } else {
+            it.filled_rectangle(30, 50, 114, 80, id(color_btn_off_bg));
+            it.rectangle(30, 50, 114, 80, id(color_border_off));
+            it.print(87, 90, id(font_huge), id(color_light_gray), TextAlign::CENTER, "3");
+          }
+
+          // BUTTON 4 (Right: x:176, y:50, w:114, h:80)
+          bool s4 = id(switch_4).state;
+          if (s4) {
+            it.filled_rectangle(176, 50, 114, 80, id(color_btn_on_bg));
+            it.rectangle(176, 50, 114, 80, id(color_white));
+            it.rectangle(177, 51, 112, 78, id(color_green));
+            it.print(233, 90, id(font_huge), id(color_white), TextAlign::CENTER, "4");
+          } else {
+            it.filled_rectangle(176, 50, 114, 80, id(color_btn_off_bg));
+            it.rectangle(176, 50, 114, 80, id(color_border_off));
+            it.print(233, 90, id(font_huge), id(color_light_gray), TextAlign::CENTER, "4");
+          }
+
+          auto ip = wifi::global_wifi_component->wifi_sta_ip_addresses();
+          if (!ip.empty() && ip[0].is_set()) {
+            char ip_buf[20];
+            ip[0].str_to(ip_buf);
+            it.print(16, 152, id(font_info), id(color_green), TextAlign::CENTER_LEFT, ip_buf);
+          }
+          auto time_now = id(ha_time).now();
+          if (time_now.is_valid()) {
+            it.strftime(304, 152, id(font_info), id(color_white), TextAlign::CENTER_RIGHT, "%H:%M:%S", time_now);
+          } else {
+            it.print(304, 152, id(font_info), id(color_amber), TextAlign::CENTER_RIGHT, "--:--:--");
+          }
+
+      # =========================================================================
+      # SCREEN 3: Switches - Buttons 5 & 6
+      # =========================================================================
+      - id: page_3_switches
+        lambda: |-
+          it.fill(id(color_dark_bg));
+          
+          it.print(16, 18, id(font_title), id(color_white), TextAlign::CENTER_LEFT, "Switches");
+          it.print(304, 18, id(font_info), id(color_light_gray), TextAlign::CENTER_RIGHT, "3/4");
+          it.horizontal_line(16, 36, 288, id(color_gray));
+
+          // BUTTON 5 (Left: x:30, y:50, w:114, h:80)
+          bool s5 = id(switch_5).state;
+          if (s5) {
+            it.filled_rectangle(30, 50, 114, 80, id(color_btn_on_bg));
+            it.rectangle(30, 50, 114, 80, id(color_white));
+            it.rectangle(31, 51, 112, 78, id(color_green));
+            it.print(87, 90, id(font_huge), id(color_white), TextAlign::CENTER, "5");
+          } else {
+            it.filled_rectangle(30, 50, 114, 80, id(color_btn_off_bg));
+            it.rectangle(30, 50, 114, 80, id(color_border_off));
+            it.print(87, 90, id(font_huge), id(color_light_gray), TextAlign::CENTER, "5");
+          }
+
+          // BUTTON 6 (Right: x:176, y:50, w:114, h:80)
+          bool s6 = id(switch_6).state;
+          if (s6) {
+            it.filled_rectangle(176, 50, 114, 80, id(color_btn_on_bg));
+            it.rectangle(176, 50, 114, 80, id(color_white));
+            it.rectangle(177, 51, 112, 78, id(color_green));
+            it.print(233, 90, id(font_huge), id(color_white), TextAlign::CENTER, "6");
+          } else {
+            it.filled_rectangle(176, 50, 114, 80, id(color_btn_off_bg));
+            it.rectangle(176, 50, 114, 80, id(color_border_off));
+            it.print(233, 90, id(font_huge), id(color_light_gray), TextAlign::CENTER, "6");
+          }
+
+          auto ip = wifi::global_wifi_component->wifi_sta_ip_addresses();
+          if (!ip.empty() && ip[0].is_set()) {
+            char ip_buf[20];
+            ip[0].str_to(ip_buf);
+            it.print(16, 152, id(font_info), id(color_green), TextAlign::CENTER_LEFT, ip_buf);
+          }
+          auto time_now = id(ha_time).now();
+          if (time_now.is_valid()) {
+            it.strftime(304, 152, id(font_info), id(color_white), TextAlign::CENTER_RIGHT, "%H:%M:%S", time_now);
+          } else {
+            it.print(304, 152, id(font_info), id(color_amber), TextAlign::CENTER_RIGHT, "--:--:--");
+          }
+
+      # =========================================================================
+      # SCREEN 4: Switches - Buttons 7 & 8
+      # =========================================================================
+      - id: page_4_switches
+        lambda: |-
+          it.fill(id(color_dark_bg));
+          
+          it.print(16, 18, id(font_title), id(color_white), TextAlign::CENTER_LEFT, "Switches");
+          it.print(304, 18, id(font_info), id(color_light_gray), TextAlign::CENTER_RIGHT, "4/4");
+          it.horizontal_line(16, 36, 288, id(color_gray));
+
+          // BUTTON 7 (Left: x:30, y:50, w:114, h:80)
+          bool s7 = id(switch_7).state;
+          if (s7) {
+            it.filled_rectangle(30, 50, 114, 80, id(color_btn_on_bg));
+            it.rectangle(30, 50, 114, 80, id(color_white));
+            it.rectangle(31, 51, 112, 78, id(color_green));
+            it.print(87, 90, id(font_huge), id(color_white), TextAlign::CENTER, "7");
+          } else {
+            it.filled_rectangle(30, 50, 114, 80, id(color_btn_off_bg));
+            it.rectangle(30, 50, 114, 80, id(color_border_off));
+            it.print(87, 90, id(font_huge), id(color_light_gray), TextAlign::CENTER, "7");
+          }
+
+          // BUTTON 8 (Right: x:176, y:50, w:114, h:80)
+          bool s8 = id(switch_8).state;
+          if (s8) {
+            it.filled_rectangle(176, 50, 114, 80, id(color_btn_on_bg));
+            it.rectangle(176, 50, 114, 80, id(color_white));
+            it.rectangle(177, 51, 112, 78, id(color_green));
+            it.print(233, 90, id(font_huge), id(color_white), TextAlign::CENTER, "8");
+          } else {
+            it.filled_rectangle(176, 50, 114, 80, id(color_btn_off_bg));
+            it.rectangle(176, 50, 114, 80, id(color_border_off));
+            it.print(233, 90, id(font_huge), id(color_light_gray), TextAlign::CENTER, "8");
+          }
+
+          auto ip = wifi::global_wifi_component->wifi_sta_ip_addresses();
+          if (!ip.empty() && ip[0].is_set()) {
+            char ip_buf[20];
+            ip[0].str_to(ip_buf);
+            it.print(16, 152, id(font_info), id(color_green), TextAlign::CENTER_LEFT, ip_buf);
+          }
+          auto time_now = id(ha_time).now();
+          if (time_now.is_valid()) {
+            it.strftime(304, 152, id(font_info), id(color_white), TextAlign::CENTER_RIGHT, "%H:%M:%S", time_now);
+          } else {
+            it.print(304, 152, id(font_info), id(color_amber), TextAlign::CENTER_RIGHT, "--:--:--");
+          }
+
+# Capacitive Touchscreen (AXS5106L)
+touchscreen:
+  - platform: axs5106
+    id: my_touch
+    i2c_id: bus_touch
+    address: 0x63
+    reset_pin: GPIO47
+    display: my_display
+    calibration:
+      x_min: 0
+      x_max: 320
+      y_min: 0
+      y_max: 172
+    transform:
+      swap_xy: true
+      mirror_x: true
+      mirror_y: false
+
+    on_release:
+      - lambda: |-
+          if (id(touch_active) && !id(gesture_handled)) {
+            uint32_t duration = millis() - id(touch_start_time);
+            if (duration < 600) {
+              int tap_x = id(touch_start_x);
+              int tap_y = id(touch_start_y);
+
+              // Button area is y: 38 to 142 (Buttons are at y:50..130)
+              if (tap_y >= 38 && tap_y <= 142) {
+                // Left Button (x: 15 to 155)
+                if (tap_x >= 15 && tap_x <= 155) {
+                  switch (id(current_screen)) {
+                    case 1: id(switch_1).toggle(); ESP_LOGI("touch", "Switch 1 toggled"); break;
+                    case 2: id(switch_3).toggle(); ESP_LOGI("touch", "Switch 3 toggled"); break;
+                    case 3: id(switch_5).toggle(); ESP_LOGI("touch", "Switch 5 toggled"); break;
+                    case 4: id(switch_7).toggle(); ESP_LOGI("touch", "Switch 7 toggled"); break;
+                  }
+                }
+                // Right Button (x: 165 to 305)
+                else if (tap_x >= 165 && tap_x <= 305) {
+                  switch (id(current_screen)) {
+                    case 1: id(switch_2).toggle(); ESP_LOGI("touch", "Switch 2 toggled"); break;
+                    case 2: id(switch_4).toggle(); ESP_LOGI("touch", "Switch 4 toggled"); break;
+                    case 3: id(switch_6).toggle(); ESP_LOGI("touch", "Switch 6 toggled"); break;
+                    case 4: id(switch_8).toggle(); ESP_LOGI("touch", "Switch 8 toggled"); break;
+                  }
+                }
+              }
+              // If tap is in the header (y < 35) or bottom dots (y > 145), tap left/right to navigate
+              else if (tap_y > 145 || tap_y < 35) {
+                if (tap_x > 160) {
+                  id(current_screen) = (id(current_screen) % 4) + 1;
+                } else {
+                  id(current_screen) = (id(current_screen) == 1) ? 4 : (id(current_screen) - 1);
+                }
+                switch (id(current_screen)) {
+                  case 1: id(my_display).show_page(page_1_switches); break;
+                  case 2: id(my_display).show_page(page_2_switches); break;
+                  case 3: id(my_display).show_page(page_3_switches); break;
+                  case 4: id(my_display).show_page(page_4_switches); break;
+                }
+              }
+            }
+          }
+          id(touch_active) = false;
+          id(gesture_handled) = false;
+          ESP_LOGI("touch", "Touch released");
+
+    on_update:
+      - lambda: |-
+          if (touches.empty()) return;
+          
+          if (id(is_booting)) return;
+
+          // Reset 1-minute inactivity timer on any touch
+          id(last_activity_time) = millis();
+
+          // If backlight was auto-dimmed to 0%, smoothly wake it up!
+          if (id(screen_is_dimmed)) {
+            id(screen_is_dimmed) = false;
+            auto call = id(lcd_backlight).turn_on();
+            call.set_transition_length(300); // 300ms wake
+            call.perform();
+            id(gesture_handled) = true; // Consume touch to prevent accidental button toggle
+            ESP_LOGI("display", "Backlight woken up by touch");
+            return;
+          }
+          
+          auto &t = touches[0];
+          
+          if (!id(touch_active)) {
+            id(touch_active) = true;
+            id(touch_start_x) = t.x;
+            id(touch_start_y) = t.y;
+            id(touch_start_time) = millis();
+            id(gesture_handled) = false;
+            ESP_LOGI("touch", "Touch down at (%d, %d)", t.x, t.y);
+            return;
+          }
+          
+          if (id(gesture_handled)) return;
+          
+          int total_dx = t.x - id(touch_start_x);
+          int total_dy = t.y - id(touch_start_y);
+          
+          // Swipe right-to-left (dx < -30) -> Next screen
+          if (total_dx < -30 && abs(total_dy) < 80) {
+            id(gesture_handled) = true;
+            id(current_screen) = (id(current_screen) % 4) + 1;
+            ESP_LOGI("touch", "Swipe Left -> Screen %d", id(current_screen));
+            switch (id(current_screen)) {
+              case 1: id(my_display).show_page(page_1_switches); break;
+              case 2: id(my_display).show_page(page_2_switches); break;
+              case 3: id(my_display).show_page(page_3_switches); break;
+              case 4: id(my_display).show_page(page_4_switches); break;
+            }
+          }
+          // Swipe left-to-right (dx > 30) -> Prev screen
+          else if (total_dx > 30 && abs(total_dy) < 80) {
+            id(gesture_handled) = true;
+            id(current_screen) = (id(current_screen) == 1) ? 4 : (id(current_screen) - 1);
+            ESP_LOGI("touch", "Swipe Right -> Screen %d", id(current_screen));
+            switch (id(current_screen)) {
+              case 1: id(my_display).show_page(page_1_switches); break;
+              case 2: id(my_display).show_page(page_2_switches); break;
+              case 3: id(my_display).show_page(page_3_switches); break;
+              case 4: id(my_display).show_page(page_4_switches); break;
+            }
+          }
